@@ -35,6 +35,10 @@ pub(crate) enum SessionPhase {
 pub(crate) struct SessionState {
     pub(crate) phase: SessionPhase,
     pub(crate) started_at: Instant,
+    /// Track last hotkey press timestamp for double-press cancel detection.
+    /// When a second press arrives within 350ms of this timestamp, the session is cancelled
+    /// rather than stopped normally.
+    pub(crate) last_press_at: Option<Instant>,
     /// A stop edge pressed during Starting (ASR handshake; second toggle press / hold release) →
     /// end_session fires immediately once the handshake completes and phase=Listening, so the
     /// edge is not lost. issue #51.
@@ -64,6 +68,7 @@ impl Default for SessionState {
         Self {
             phase: SessionPhase::Idle,
             started_at: Instant::now(),
+            last_press_at: None,
             pending_stop: false,
             cancelled: false,
             focus_target: None,
@@ -99,6 +104,7 @@ pub(crate) fn begin_session_state_with_id(
     }
     state.phase = SessionPhase::Starting;
     state.started_at = Instant::now();
+    state.last_press_at = Some(Instant::now());
     state.pending_stop = false;
     state.cancelled = false;
     state.focus_target = focus_target;
@@ -112,12 +118,29 @@ pub(crate) fn begin_session_state_with_id(
 
 /// stop_dictation / hold release during Starting only records pending_stop, processed after
 /// startup completes.
-pub(crate) fn request_stop_during_starting_state(state: &mut SessionState) -> bool {
+pub(crate) fn request_stop_during_starting_state(
+    state: &mut SessionState,
+    at: Instant,
+) -> bool {
     if state.phase != SessionPhase::Starting {
         return false;
     }
+    state.last_press_at = Some(at);
     state.pending_stop = true;
     true
+}
+
+const DOUBLE_PRESS_CANCEL_WINDOW_MS: u64 = 350;
+
+/// Check if a new press should trigger cancel based on timing.
+/// Returns true if the press is within DOUBLE_PRESS_CANCEL_WINDOW_MS of last_press_at.
+pub(crate) fn should_cancel_on_press(state: &SessionState, at: Instant) -> bool {
+    if let Some(last_press) = state.last_press_at {
+        let elapsed = at.saturating_duration_since(last_press);
+        elapsed.as_millis() < DOUBLE_PRESS_CANCEL_WINDOW_MS as u128
+    } else {
+        false
+    }
 }
 
 /// Result of the cancel race check between awaits inside begin_session.
@@ -130,6 +153,10 @@ pub(crate) enum BeginOutcome {
     /// A pending_stop edge accumulated during Starting; end_session must run immediately (fast
     /// hold release / rapid toggle double press).
     PendingStop,
+    /// Fast double-press detected (< 350ms between presses); should cancel (not stop) the session.
+    /// This differs from PendingStop: cancel discards audio and shows cancel feedback, while
+    /// stop processes the recording normally.
+    PendingCancel,
     /// cancel_session fired meanwhile (cancelled=true or phase externally reset to Idle).
     /// Must roll back recorder + ASR resources; do not enter Listening.
     CancelRaced,
@@ -147,7 +174,13 @@ pub(crate) fn finish_starting_session_state(
         state.phase = SessionPhase::Listening;
         let pending = std::mem::replace(&mut state.pending_stop, false);
         if pending {
-            BeginOutcome::PendingStop
+            // Check if it's a fast double-press (cancel) or slow stop.
+            // Fast double-press (< 350ms) = cancel, slow = normal stop.
+            if should_cancel_on_press(state, Instant::now()) {
+                BeginOutcome::PendingCancel
+            } else {
+                BeginOutcome::PendingStop
+            }
         } else {
             BeginOutcome::Started
         }
@@ -348,12 +381,12 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(request_stop_during_starting_state(&mut state));
+        assert!(request_stop_during_starting_state(&mut state, Instant::now()));
         assert!(state.pending_stop);
 
         state.phase = SessionPhase::Listening;
         state.pending_stop = false;
-        assert!(!request_stop_during_starting_state(&mut state));
+        assert!(!request_stop_during_starting_state(&mut state, Instant::now()));
         assert!(!state.pending_stop);
     }
 
@@ -609,5 +642,64 @@ mod tests {
             assert_eq!(state.phase, phase);
             assert_eq!(state.cancelled, cancelled);
         }
+    }
+
+    #[test]
+    fn fast_double_press_should_cancel() {
+        let mut state = SessionState::default();
+        let t0 = Instant::now();
+        state.last_press_at = Some(t0);
+
+        let t1 = t0 + std::time::Duration::from_millis(300);
+        assert!(should_cancel_on_press(&state, t1));
+    }
+
+    #[test]
+    fn slow_double_press_should_not_cancel() {
+        let mut state = SessionState::default();
+        let t0 = Instant::now();
+        state.last_press_at = Some(t0);
+
+        let t1 = t0 + std::time::Duration::from_millis(400);
+        assert!(!should_cancel_on_press(&state, t1));
+    }
+
+    #[test]
+    fn boundary_350ms_should_not_cancel() {
+        let mut state = SessionState::default();
+        let t0 = Instant::now();
+        state.last_press_at = Some(t0);
+
+        let t1 = t0 + std::time::Duration::from_millis(350);
+        assert!(!should_cancel_on_press(&state, t1));
+    }
+
+    #[test]
+    fn pending_cancel_outcome_on_fast_double_press() {
+        let mut state = SessionState::default();
+        let session_id = new_session_id();
+        begin_session_state_with_id(&mut state, None, None, session_id);
+
+        // Simulate fast second press during Starting
+        let t1 = state.last_press_at.unwrap() + std::time::Duration::from_millis(200);
+        request_stop_during_starting_state(&mut state, t1);
+
+        let outcome = finish_starting_session_state(&mut state, session_id);
+        assert_eq!(outcome, BeginOutcome::PendingCancel);
+    }
+
+    #[test]
+    fn pending_stop_outcome_on_slow_double_press() {
+        let mut state = SessionState::default();
+        let session_id = new_session_id();
+        begin_session_state_with_id(&mut state, None, None, session_id);
+
+        // Simulate slow second press during Starting
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let t1 = Instant::now();
+        request_stop_during_starting_state(&mut state, t1);
+
+        let outcome = finish_starting_session_state(&mut state, session_id);
+        assert_eq!(outcome, BeginOutcome::PendingStop);
     }
 }

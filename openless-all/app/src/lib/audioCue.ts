@@ -32,6 +32,16 @@ export function recordStartCueTones(): CueTone[] {
   ];
 }
 
+// Falling minor third two-tone (A5 880Hz -> E5 659.25Hz): a clear descending sound for
+// "recording canceled", opposite of the rising start cue. The tones overlap slightly
+// for a smooth "ding-dong" fall.
+export function recordCancelCueTones(): CueTone[] {
+  return [
+    { freq: 880, startMs: 0, durationMs: 100, peakGain: 0.14 },
+    { freq: 659.25, startMs: 75, durationMs: 140, peakGain: 0.16 },
+  ];
+}
+
 /** Total cue duration (ms) = end time of the last tone; callers use it to schedule stop / preview feedback. */
 export function cueTotalDurationMs(tones: CueTone[]): number {
   return tones.reduce((max, t) => Math.max(max, t.startMs + t.durationMs), 0);
@@ -350,6 +360,117 @@ function playRecordStartCueOnce(
       schedule();
     } else if (!runningAfterResume) {
       // Even if this round is already late, clear the bad context so the next recording can recover.
+      recover();
+    }
+  };
+
+  recoveryTimer = setTimeout(() => settle(false), RESUME_TIMEOUT_MS);
+  try {
+    void ctx.resume().then(
+      () => settle(ctx.state === 'running'),
+      () => settle(false),
+    );
+  } catch {
+    settle(false);
+  }
+}
+
+// Schedule cancel cue voices with the falling tone pattern.
+function scheduleCancelCueVoices(ctx: AudioContext): void {
+  stopVoices();
+
+  const base = ctx.currentTime + 0.01;
+  for (const tone of recordCancelCueTones()) {
+    try {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      const t0 = base + tone.startMs / 1000;
+      const tEnd = t0 + tone.durationMs / 1000;
+      osc.frequency.setValueAtTime(tone.freq, t0);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(tone.peakGain, t0 + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.0001, tEnd);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(tEnd + 0.02);
+
+      const voice: ActiveVoice = { osc, gain };
+      activeVoices.push(voice);
+      osc.onended = () => {
+        activeVoices = activeVoices.filter((v) => v !== voice);
+        try {
+          osc.disconnect();
+          gain.disconnect();
+        } catch {
+          // noop
+        }
+      };
+    } catch {
+      // One tone failing to create/schedule must not affect the rest.
+    }
+  }
+}
+
+/** Play the "recording canceled" cue. Silently degrades when Web Audio is unavailable. */
+export function playRecordCancelCue(): void {
+  clearRecoveryTimer();
+  const myPlay = ++playSeq;
+  const stopAtRequest = stopSeq;
+  const requestedAt = nowMs();
+  const shouldPlay = () =>
+    shouldPlayDeferredCue({
+      superseded: myPlay !== playSeq,
+      stoppedWhileWaiting: stopSeq !== stopAtRequest,
+      elapsedMs: nowMs() - requestedAt,
+      lateThresholdMs: DEFERRED_CUE_LATE_THRESHOLD_MS,
+    });
+  playRecordCancelCueOnce(true, myPlay, shouldPlay);
+}
+
+function playRecordCancelCueOnce(
+  allowRecreate: boolean,
+  myPlay: number,
+  shouldPlay: () => boolean,
+): void {
+  const ctx = getContext();
+  if (!ctx) return;
+
+  const recover = () => {
+    if (myPlay !== playSeq || sharedCtx !== ctx) return;
+    discardContext(ctx);
+    if (allowRecreate && shouldPlay()) playRecordCancelCueOnce(false, myPlay, shouldPlay);
+  };
+
+  const schedule = () => {
+    const startedAt = ctx.currentTime;
+    scheduleCancelCueVoices(ctx);
+    recoveryTimer = setTimeout(
+      () => {
+        if (ctx.currentTime <= startedAt) recover();
+      },
+      cueTotalDurationMs(recordCancelCueTones()) + 50,
+    );
+  };
+
+  if (audioContextActionForState(ctx.state) !== 'resume') {
+    schedule();
+    return;
+  }
+
+  let settled = false;
+  const settle = (runningAfterResume: boolean): void => {
+    if (settled || myPlay !== playSeq || sharedCtx !== ctx) return;
+    settled = true;
+    clearRecoveryTimer();
+    const action = cueActionAfterResume({
+      runningAfterResume,
+      shouldPlay: shouldPlay(),
+      allowRecreate,
+    });
+    if (action === 'schedule') {
+      schedule();
+    } else if (!runningAfterResume) {
       recover();
     }
   };
